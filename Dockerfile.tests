@@ -1,0 +1,23 @@
+# Containerized lint, type, and test suite. Base image pinned by digest; Python
+# dependencies pinned with hashes (requirements-dev.lock, exported from uv.lock).
+FROM python:3.13.15-slim-bookworm@sha256:2325bb286ec344af3e5898cc224b5844e2707ac6e26b1632516fd3edc84a5e26
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# zsh runs the example scripts; ssh-keygen is used by the image flow. The fakes are run
+# under `env -i PATH=/usr/bin:/bin`, so python3 must also be reachable from /usr/bin.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends zsh openssh-client \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -s /usr/local/bin/python3 /usr/bin/python3
+
+WORKDIR /work
+COPY requirements-dev.lock .
+RUN pip install --require-hashes --no-deps -r requirements-dev.lock
+
+RUN useradd --create-home --uid 10001 tester && chown tester:tester /work
+COPY --chown=tester:tester . .
+USER tester
+CMD ["sh", "tests/run_checks.sh"]

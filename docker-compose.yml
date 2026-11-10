@@ -1,0 +1,7 @@
+services:
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.tests
+    image: automac-tests:local
+    network_mode: none

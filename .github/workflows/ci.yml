@@ -1,0 +1,20 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build test image
+        run: docker build -f Dockerfile.tests -t automac-tests:ci .
+      - name: Lint, types, tests (no network)
+        run: docker run --rm --network none automac-tests:ci

@@ -1,0 +1,51 @@
+# Example workflow for a project with a macOS target. Copy to .github/workflows/.
+# Harness tests run anywhere; VM tests run on a self-hosted Apple Silicon Mac with Tart.
+name: macos-vm
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: docker build -f Dockerfile.tests -t tests:ci . && docker run --rm --network none tests:ci
+
+  vm-smoke:
+    needs: harness
+    # Never run untrusted fork code on your own Mac.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, tart]
+    # At most two macOS guests per host; one VM job at a time is the safe default.
+    concurrency: { group: tart-vm-${{ runner.name }}, cancel-in-progress: false }
+    timeout-minutes: 60
+    env:
+      # Configured on the runner, outside the workspace, owned by the runner's user.
+      TARTVM_TART: ${{ vars.TARTVM_TART }}
+      TARTVM_HOME: ${{ vars.TARTVM_HOME }}
+      TARTVM_PREFIX: ${{ vars.TARTVM_PREFIX }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Remove leftover clones
+        run: scripts/vm-test clean
+      - name: Check host
+        run: scripts/vm-test doctor
+      - name: Build app (unsigned is fine for the smoke test)
+        run: scripts/build.sh --output build/MyApp.app
+      - name: Smoke test in a clean VM
+        run: scripts/vm-test test build/MyApp.app --report build/vm-report.json
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vm-report
+          path: |
+            build/vm-report.json
+            ${{ vars.TARTVM_HOME }}/logs/*.log
+          if-no-files-found: error
