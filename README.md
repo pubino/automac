@@ -67,3 +67,7 @@ first (see [docs/images.md](docs/images.md)); `tartvm image` does not download.
 
 Everything here is tested against fakes, so CI needs neither a Mac nor a VM. Skipped
 tests fail the run.
+
+## License
+
+[MIT](LICENSE). Tart itself is licensed separately (Fair Source); check its terms for your use.

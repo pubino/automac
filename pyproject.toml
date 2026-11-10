@@ -7,6 +7,7 @@ name = "tartvm-examples"
 version = "0.1.0"
 description = "Reference library and tests for testing macOS apps in disposable Tart VMs"
 requires-python = ">=3.12"
+license = "MIT"
 dependencies = []
 
 [dependency-groups]
