@@ -56,7 +56,7 @@ first (see [docs/images.md](docs/images.md)); `tartvm image` does not download.
   `skills/macos-vm-testing` into `~/.claude/skills/` (or pass a project's
   `.claude/skills` directory). Updates to this repo then reach every project.
 - **Any agent:** paste a file from [`prompts/`](prompts/), replacing `<AUTOMAC>` with the
-  path to this checkout, or tell it to read [`AGENTS.md`](AGENTS.md).
+  path to this checkout, or tell it to read [`docs/for-agents.md`](docs/for-agents.md).
 
 ## Developing this repo
 
