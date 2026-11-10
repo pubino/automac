@@ -1,0 +1,17 @@
+.env*
+!example.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+build/
+*.db
+*.ipsw
+*.log
+.DS_Store
+CLAUDE.md
+.claude/
+*.egg-info/

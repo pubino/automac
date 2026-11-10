@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Fake ssh for the zsh script tests: answers guest commands from $FAKE_* settings.
+Unknown commands exit 99 so a test can never pass by accident."""
+
+import hashlib
+import json
+import os
+import shlex
+import sys
+from pathlib import Path
+
+state = Path(os.environ["FAKE_STATE"])
+argv = sys.argv[1:]
+remote = shlex.split(argv[-1])
+assert argv[-2] == "--", "remote command must follow --"
+assert remote[:2] == ["/usr/bin/env", "-i"], remote
+cmd = [a for a in remote[2:] if not ("=" in a and a.split("=", 1)[0].isupper())]
+with (state / "ssh.jsonl").open("a") as fh:
+    fh.write(json.dumps({
+        "cmd": cmd, "n": "-n" in argv, "askpass": "SSH_ASKPASS" in os.environ,
+        "agent": "SSH_AUTH_SOCK" in os.environ, "F": argv[argv.index("-F") + 1],
+    }) + "\n")
+
+env = os.environ.get
+joined = " ".join(cmd)
+
+
+def out(text: str = "", rc: int = 0, err: str = "") -> None:
+    sys.stdout.write(text)
+    sys.stderr.write(err)
+    sys.exit(rc)
+
+
+def guest_file(path: str) -> Path:
+    return state / "guest" / path.strip("/").replace("/", "_")
+
+
+if cmd == ["/usr/bin/true"]:
+    out(rc=255 if env("FAKE_SSH_DOWN") else 0)
+if cmd[:2] == ["/usr/sbin/sysctl", "-n"]:
+    out(env("FAKE_VMM", "1") + "\n")
+if cmd == ["/usr/bin/id", "-un"]:
+    out(env("FAKE_USER", "tester") + "\n")
+if cmd[:2] == ["/bin/ls", "-d"]:
+    if env("FAKE_SHARED"):
+        out(cmd[2] + "\n")
+    out(rc=1, err=f"ls: {cmd[2]}: No such file or directory\n")
+if cmd[:2] == ["/usr/bin/sudo", "-n"]:
+    out(rc=0 if env("FAKE_SUDO") else 1, err="" if env("FAKE_SUDO") else "sudo: a password is required\n")
+if cmd[0] == "/bin/sh" and "credentials" in cmd[2]:
+    out("authorized_keys\n" + "".join(f"{p}\n" for p in env("FAKE_CREDS", "").split()))
+if cmd[0] == "/usr/bin/security":
+    out(f"\n     {env('FAKE_IDENTITIES', '0')} valid identities found\n")
+if cmd[0] == "/usr/bin/shasum":
+    data = guest_file(cmd[-1]).read_bytes()
+    if env("FAKE_CORRUPT"):
+        data += b"x"
+    out(f"{hashlib.sha256(data).hexdigest()}  {cmd[-1]}\n")
+if "/sbin/shutdown" in joined:
+    assert "-n" not in argv, "seal needs stdin for sudo -S"
+    assert sys.stdin.read().strip(), "no password on stdin"
+    if not env("FAKE_NO_POWEROFF"):
+        for f in state.glob("running-*"):
+            (state / f.name.replace("running-", "stopped-", 1)).touch()
+    out(rc=255, err="Connection closed by remote host\n")
+if cmd[0] == "/bin/sh" and "open -n" in cmd[2]:
+    launch = env("FAKE_LAUNCH", "running 4242")
+    out(launch + "\n", rc=0 if launch.startswith("running") else 1)
+if cmd[0] == "/usr/bin/find":
+    crashes = env("FAKE_CRASHES", "")
+    out("".join(f"/Users/tester/Library/Logs/DiagnosticReports/{c}\n" for c in crashes.split()))
+if cmd[0] in ("/bin/mkdir", "/usr/bin/tar", "/usr/bin/touch", "/usr/bin/pkill", "/bin/sh"):
+    out()
+out(rc=99, err=f"fake ssh: unexpected guest command {cmd}\n")

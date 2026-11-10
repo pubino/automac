@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tartvm-examples"
+version = "0.1.0"
+description = "Reference library and tests for testing macOS apps in disposable Tart VMs"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.8", "mypy>=1.13"]
+
+[tool.setuptools.packages.find]
+where = ["examples/python"]
+
+[tool.setuptools.package-data]
+tartvm = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["examples/python", "."]
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["examples/python", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PTH"]
+ignore = ["S603", "S607"]  # subprocess use is centralized in runner.py with argument lists
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S108", "E501"]
+
+[tool.ruff.format]
+exclude = []
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+mypy_path = "examples/python:."
+files = ["examples/python", "tests"]
+explicit_package_bases = true

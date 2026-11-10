@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Fake tart for the zsh script tests. tartvm runs tart under `env -i`, so this fake
+cannot see test env vars: its state lives in $TART_HOME/../../state, and behaviour flags
+are files there (e.g. state/FAKE_RUN_EXIT).
+
+vms.json holds the VM list (changed only by synchronous commands); a VM is running while
+running-<name> exists and stopped-<name> does not. `tart run` blocks until stopped-<name>
+appears (written by `stop` or by a guest shutdown seen by the fake ssh); the marker is
+sticky so a stop that races ahead of the run still ends it. Every call is appended to calls.jsonl.
+"""
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+state = Path(os.environ["TART_HOME"]).parent.parent / "state"
+vms_file = state / "vms.json"
+args = sys.argv[1:]
+
+assert os.environ.get("TART_HOME", "").endswith("/tart"), "TART_HOME not set"
+assert os.environ.get("TART_NO_AUTO_PRUNE") == "1", "auto-prune not disabled"
+with (state / "calls.jsonl").open("a") as fh:
+    fh.write(json.dumps(args) + "\n")
+
+vms = json.loads(vms_file.read_text()) if vms_file.exists() else []
+
+
+def save() -> None:
+    vms_file.write_text(json.dumps(vms))
+
+
+def fail(msg: str) -> None:
+    print(f"fake tart: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+cmd = args[0] if args else ""
+if cmd == "--version":
+    print("2.41.1")
+elif cmd == "list":
+    print(json.dumps([
+        {"Name": n, "Running": (state / f"running-{n}").exists()
+         and not (state / f"stopped-{n}").exists(), "Source": "local"} for n in vms
+    ]))
+elif cmd == "create":
+    vms.append(args[-1]); save()
+elif cmd == "clone":
+    if args[1] not in vms:
+        fail(f"no VM {args[1]}")
+    vms.append(args[2]); save()
+elif cmd == "delete":
+    if args[1] not in vms:
+        fail(f"no VM {args[1]}")
+    vms.remove(args[1]); save()
+elif cmd == "rename":
+    vms[vms.index(args[1])] = args[2]; save()
+elif cmd == "set":
+    pass
+elif cmd == "ip":
+    # Like the real tart: only a running VM has an address. Wait briefly for `run`.
+    name, deadline = args[-1], time.monotonic() + 5
+    while not (state / f"running-{name}").exists():
+        if (state / "FAKE_RUN_EXIT").exists() or time.monotonic() > deadline:
+            fail(f"VM {name} is not running")
+        time.sleep(0.02)
+    print("192.168.64.9")
+elif cmd == "stop":
+    (state / f"stopped-{args[-1]}").touch()
+elif cmd == "run":
+    name = args[-1]
+    if (state / "FAKE_RUN_EXIT").exists():
+        sys.exit(1)
+    flag = state / f"running-{name}"
+    flag.touch()
+    (state / "current").write_text(name)
+    deadline = time.monotonic() + 60
+    while not (state / f"stopped-{name}").exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    flag.unlink(missing_ok=True)
+else:
+    fail(f"unexpected command {args}")

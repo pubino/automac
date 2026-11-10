@@ -1,0 +1,388 @@
+#!/bin/zsh
+# tartvm: test a macOS .app in a throwaway Tart VM. Reference implementation; copy it.
+#
+#   tartvm doctor                                     check host, Tart, settings
+#   tartvm image --ipsw FILE [--disk-gb N] [--keep-failed] [--dry-run]
+#                                                     build the sealed base image
+#   tartvm test APP.app [--process NAME] [--seconds N] [--headless] [--keep]
+#                       [--report FILE] [--dry-run]   smoke-test an app in a clone
+#   tartvm status                                     list this project's VMs
+#   tartvm clean [--dry-run]                          delete leftover clones
+#
+# Settings come from the environment (see example.env). Required: TARTVM_TART (absolute
+# path to a pinned tart binary), TARTVM_HOME (state dir; Tart VMs go in $TARTVM_HOME/tart).
+# Optional: TARTVM_PREFIX (tartvm), TARTVM_IMAGE ($PREFIX-image-base), TARTVM_USER (tester),
+# TARTVM_CPUS (4), TARTVM_MEMORY_GB (8).
+# TARTVM_BOOT_TIMEOUT (600) bounds the wait for a booting guest's IP and SSH;
+# TARTVM_SHUTDOWN_TIMEOUT (600) bounds the wait for a sealing guest to power itself off.
+# Test hooks only: TARTVM_SSH, TARTVM_SCP, TARTVM_POLL replace ssh, scp, the poll interval.
+set -euo pipefail
+setopt extended_glob
+
+die() { print -ru2 -- "tartvm: $*"; exit 1; }
+say() { print -r -- "== $*"; }
+SELF="${0:A}"  # inside functions zsh sets $0 to the function name
+usage() { sed -n '2,10p' "$SELF" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+# ----------------------------------------------------------------------------- settings
+load_config() {
+  [[ -n "${TARTVM_TART:-}" && -n "${TARTVM_HOME:-}" ]] \
+    || die "TARTVM_TART and TARTVM_HOME are required (see example.env)"
+  [[ "$TARTVM_TART" == /* && "$TARTVM_HOME" == /* ]] || die "TARTVM_TART and TARTVM_HOME must be absolute"
+  TART="$TARTVM_TART"
+  PREFIX="${TARTVM_PREFIX:-tartvm}"
+  [[ "$PREFIX" == [a-z][a-z0-9]## ]] || die "TARTVM_PREFIX must be lowercase letters/digits"
+  IMAGE="${TARTVM_IMAGE:-$PREFIX-image-base}"
+  GUSER="${TARTVM_USER:-tester}"
+  [[ "$GUSER" == [a-z][a-z0-9]## ]] || die "TARTVM_USER must be lowercase letters/digits"
+  CPUS="${TARTVM_CPUS:-4}"; MEM_GB="${TARTVM_MEMORY_GB:-8}"
+  [[ "$CPUS" == <1-64> && "$MEM_GB" == <2-256> ]] || die "TARTVM_CPUS 1-64, TARTVM_MEMORY_GB 2-256"
+  SSH="${TARTVM_SSH:-/usr/bin/ssh}"; SCP="${TARTVM_SCP:-/usr/bin/scp}"; POLL="${TARTVM_POLL:-5}"
+  SHUTDOWN_TIMEOUT="${TARTVM_SHUTDOWN_TIMEOUT:-600}"; BOOT_TIMEOUT="${TARTVM_BOOT_TIMEOUT:-600}"
+  [[ "$BOOT_TIMEOUT" == <1-3600> ]] || die "TARTVM_BOOT_TIMEOUT must be 1-3600"
+  [[ "$SHUTDOWN_TIMEOUT" == <1-3600> ]] || die "TARTVM_SHUTDOWN_TIMEOUT must be 1-3600"
+  SSHDIR="$TARTVM_HOME/ssh"; LOGS="$TARTVM_HOME/logs"
+  check_name "$IMAGE"
+}
+
+check_name() {
+  [[ "$1" == ${PREFIX}-[a-z]##-[A-Za-z0-9_.-]## ]] || die "refusing to manage VM named '$1'"
+}
+
+# Tart with a project-private TART_HOME and no inherited environment.
+tart_() {
+  /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    TART_HOME="$TARTVM_HOME/tart" TART_NO_AUTO_PRUNE=1 "$TART" "$@"
+}
+
+DRY_RUN=0
+mut() {  # mutating tart call: printed instead of run under --dry-run
+  if (( DRY_RUN )); then print -r -- "+ tart ${(j: :)${(@q)@}}"; else tart_ "$@"; fi
+}
+
+# od reads exactly N bytes: no SIGPIPE, so safe under pipefail (tr </dev/urandom | head is not).
+rand_hex() { /usr/bin/od -An -N"$1" -tx1 /dev/urandom | /usr/bin/tr -d ' \n'; }
+host_sha256() {
+  if [[ -x /usr/bin/shasum ]]; then /usr/bin/shasum -a 256 "$1" | cut -d' ' -f1
+  else sha256sum "$1" | cut -d' ' -f1; fi
+}
+
+vm_exists() { tart_ list --source local --format json | /usr/bin/grep -q "\"Name\" *: *\"$1\""; }
+
+# ----------------------------------------------------------------------------- guest ssh
+GUEST_IP=""; PW_AUTH=0
+ssh_opts() {
+  local -a o
+  o=(-F /dev/null -o UserKnownHostsFile="$SSHDIR/known_hosts" -o GlobalKnownHostsFile=/dev/null
+     -o HostKeyAlias="$IMAGE" -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes
+     -o PermitLocalCommand=no -o ConnectTimeout=10 -o ServerAliveInterval=30 -o LogLevel=ERROR)
+  if (( PW_AUTH )); then
+    o+=(-o BatchMode=no -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1
+        -o PreferredAuthentications=keyboard-interactive,password -o StrictHostKeyChecking=accept-new)
+  else
+    o+=(-i "$SSHDIR/id_ed25519" -o BatchMode=yes -o IdentitiesOnly=yes -o PasswordAuthentication=no
+        -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=yes)
+  fi
+  reply=("${o[@]}")
+}
+
+client_env() {
+  reply=(/usr/bin/env -u SSH_AUTH_SOCK)
+  (( PW_AUTH )) && reply+=(SSH_ASKPASS="$SSHDIR/askpass" SSH_ASKPASS_REQUIRE=force DISPLAY=none
+                           TARTVM_PASSWORD_FILE="$SSHDIR/guest-password")
+  return 0
+}
+
+# g CMD ARGS...: run in the guest with a clean env. stdin is discarded (-n); use gin for stdin.
+g()   { _g -n "$@"; }
+gin() { _g "" "$@"; }
+_g() {
+  local nflag="$1"; shift
+  local -a remote env_ opts
+  remote=(/usr/bin/env -i HOME="/Users/$GUSER" USER="$GUSER" PATH=/usr/bin:/bin:/usr/sbin:/sbin
+          LANG=C LC_ALL=C "$@")
+  client_env; env_=("${reply[@]}"); ssh_opts; opts=("${reply[@]}")
+  "${env_[@]}" "$SSH" ${nflag:+$nflag} "${opts[@]}" "$GUSER@$GUEST_IP" -- "${(j: :)${(@q)remote}}"
+}
+
+put() {
+  local -a env_ opts; client_env; env_=("${reply[@]}"); ssh_opts; opts=("${reply[@]}")
+  "${env_[@]}" "$SCP" -q "${opts[@]}" "$1" "$GUSER@$GUEST_IP:$2"
+}
+
+wait_ssh() {
+  local deadline=$(( SECONDS + $1 )) err=""
+  until err="$(g /usr/bin/true 2>&1)"; do
+    (( SECONDS < deadline )) || die "VM did not accept SSH within $1s: ${err[-200,-1]}"
+    sleep "$POLL"
+  done
+}
+
+# ----------------------------------------------------------------------------- lifecycle
+VM=""; TART_PID=""; KEEP=0
+boot() {  # boot NAME GRAPHICS(0|1) [PROVISIONING]
+  local name="$1" graphics="$2" prov="${3:-}"; local -a argv
+  argv=(run --no-audio --no-clipboard)
+  (( graphics )) || argv+=(--no-graphics)
+  [[ -n "$prov" ]] && argv+=("--provisioning-opts=$prov")
+  argv+=("$name")
+  mkdir -p "$LOGS"
+  # The argv is never logged: on first boot it carries the guest password.
+  /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    TART_HOME="$TARTVM_HOME/tart" TART_NO_AUTO_PRUNE=1 "$TART" "${argv[@]}" \
+    </dev/null >>"$LOGS/$name.log" 2>&1 &
+  TART_PID=$!
+  sleep "$POLL"
+  kill -0 "$TART_PID" 2>/dev/null || die "tart run exited immediately; see $LOGS/$name.log"
+  if ! GUEST_IP="$(tart_ ip --wait "$BOOT_TIMEOUT" "$name" 2>&1)"; then
+    kill -0 "$TART_PID" 2>/dev/null || die "tart run exited during boot; see $LOGS/$name.log"
+    die "tart ip failed: $GUEST_IP"
+  fi
+  [[ "$GUEST_IP" == <0-255>.<0-255>.<0-255>.<0-255> ]] || die "unexpected tart ip output: $GUEST_IP"
+  wait_ssh "$BOOT_TIMEOUT"
+  kill -0 "$TART_PID" 2>/dev/null || die "tart run exited during boot; see $LOGS/$name.log"
+}
+
+wait_power_off() {  # the guest must stop by itself; tart stop can drop its last writes
+  local deadline=$(( SECONDS + $1 ))
+  while kill -0 "$TART_PID" 2>/dev/null; do
+    (( SECONDS < deadline )) || die "VM did not shut itself down within $1s"
+    sleep "$POLL"
+  done
+  wait "$TART_PID" 2>/dev/null || true
+  TART_PID=""
+}
+
+teardown() {
+  local rc=$?
+  if [[ -n "$TART_PID" ]] && kill -0 "$TART_PID" 2>/dev/null; then
+    tart_ stop --timeout 60 "$VM" >/dev/null 2>&1 || true
+    wait "$TART_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$VM" ]] && vm_exists "$VM"; then
+    if (( KEEP )); then print -ru2 -- "tartvm: keeping $VM for inspection"
+    else tart_ delete "$VM" >/dev/null || print -ru2 -- "tartvm: could not delete $VM"; fi
+  fi
+  return $rc
+}
+trap teardown EXIT
+trap 'exit 130' INT TERM
+
+# ----------------------------------------------------------------------------- checks
+typeset -a CHECKS; FAILED=0
+record() {  # record NAME pass|fail DETAIL
+  local detail="${3//\"/'}"
+  detail="${detail//\\//}"
+  detail="${detail//[[:cntrl:]]/ }"
+  CHECKS+=("{\"name\": \"$1\", \"result\": \"$2\", \"detail\": \"$detail\"}")
+  [[ "$2" == pass ]] || FAILED=1
+  print -r -- "   $2  $1: $3"
+}
+
+boundary_checks() {
+  local out err
+  out="$(g /usr/sbin/sysctl -n kern.hv_vmm_present 2>/dev/null || true)"
+  [[ "$out" == 1 ]] && record virtual_machine pass "kern.hv_vmm_present=1" \
+                    || record virtual_machine fail "kern.hv_vmm_present='$out'"
+  out="$(g /usr/bin/id -un 2>/dev/null || true)"
+  [[ "$out" == "$GUSER" ]] && record guest_account pass "$out" || record guest_account fail "'$out'"
+  if err="$(g /bin/ls -d '/Volumes/My Shared Files' 2>&1)"; then
+    record no_shared_folders fail "shared folder mount exists"
+  elif [[ "$err" == *"No such file"* ]]; then record no_shared_folders pass "no shared folder mount"
+  else record no_shared_folders fail "probe failed: $err"; fi
+  if g /usr/bin/sudo -n /usr/bin/true >/dev/null 2>&1; then
+    record no_passwordless_sudo fail "test account has passwordless sudo"
+  else record no_passwordless_sudo pass "sudo -n denied"; fi
+  local rc=0
+  out="$(g /bin/sh -c "$CREDENTIAL_PROBE" 2>/dev/null)" || rc=$?
+  out="$(print -r -- "$out" | /usr/bin/grep -vx -e authorized_keys -e '' || true)"
+  if (( rc == 0 )) && [[ -z "$out" ]]; then record no_credentials pass "no credential files"
+  else record no_credentials fail "${${(f)out}:-probe failed ($rc)}"; fi
+  out="$(g /usr/bin/security find-identity -v -p codesigning 2>/dev/null || true)"
+  [[ "$out" == *" 0 valid identities found"* ]] && record no_signing_identities pass "0 identities" \
+    || record no_signing_identities fail "identities visible or output unparsed"
+}
+
+CREDENTIAL_PROBE='for p in "$HOME/.config/gh" "$HOME/.appstoreconnect" "$HOME/.netrc" "$HOME/.git-credentials"; do [ ! -e "$p" ] || echo "$p"; done; /bin/ls -A "$HOME/.ssh" 2>/dev/null; true'
+LAUNCH_SCRIPT='/usr/bin/open -n "$1" || exit 2; i=0; while ! /usr/bin/pgrep -x "$2" >/dev/null; do /bin/sleep 2; i=$((i + 2)); [ "$i" -lt "$4" ] || { echo "did not start within $4s"; exit 1; }; done; i=0; while [ "$i" -lt "$3" ]; do /bin/sleep 2; i=$((i + 2)); /usr/bin/pgrep -x "$2" >/dev/null || { echo exited; exit 1; }; done; echo "running $(/usr/bin/pgrep -nx "$2")"'
+
+# ----------------------------------------------------------------------------- commands
+cmd_doctor() {
+  local ok=1
+  [[ "$(uname -m)" == arm64 ]] && say "Apple Silicon: yes" || { say "Apple Silicon: NO"; ok=0; }
+  local v; v="$(sw_vers -productVersion 2>/dev/null || echo unknown)"
+  say "host macOS: $v (first-boot provisioning needs 27+ on host and guest)"
+  if [[ -x "$TART" ]]; then say "tart: $("$TART" --version) at $TART"
+  else say "tart: MISSING at $TART"; ok=0; fi
+  say "TART_HOME: $TARTVM_HOME/tart"
+  if [[ -d "$TARTVM_HOME" ]]; then
+    say "free disk: $(df -g "$TARTVM_HOME" | awk 'NR==2 {print $4}') GB (image ~30-80 GB, IPSW ~20 GB)"
+  fi
+  vm_exists "$IMAGE" 2>/dev/null && say "image $IMAGE: present" || say "image $IMAGE: not built (tartvm image)"
+  (( ok )) || die "doctor found problems"
+}
+
+ensure_ssh_material() {
+  mkdir -p "$SSHDIR"; chmod 700 "$SSHDIR"
+  [[ -f "$SSHDIR/id_ed25519" ]] || /usr/bin/ssh-keygen -q -t ed25519 -N "" -C "$PREFIX-vm" -f "$SSHDIR/id_ed25519"
+  if [[ ! -f "$SSHDIR/guest-password" ]]; then
+    ( umask 077; rand_hex 24 >"$SSHDIR/guest-password" )
+  fi
+  chmod 600 "$SSHDIR/guest-password"
+  print -r -- '#!/bin/sh
+exec /bin/cat -- "$TARTVM_PASSWORD_FILE"' >"$SSHDIR/askpass"
+  chmod 700 "$SSHDIR/askpass"
+  [[ -f "$SSHDIR/known_hosts" ]] && /usr/bin/ssh-keygen -q -R "$IMAGE" -f "$SSHDIR/known_hosts" >/dev/null 2>&1 || true
+}
+
+cmd_image() {
+  local ipsw="" disk=80 keep_failed=0
+  while (( $# )); do
+    case "$1" in
+      --ipsw) ipsw="$2"; shift 2 ;;
+      --disk-gb) disk="$2"; shift 2 ;;
+      --keep-failed) keep_failed=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      *) usage ;;
+    esac
+  done
+  [[ -f "$ipsw" ]] || die "--ipsw must name a downloaded, hash-checked .ipsw file"
+  [[ "$disk" == <40-500> ]] || die "--disk-gb must be 40-500"
+  local tmp="${IMAGE/-image-/-provision-}"
+  [[ "$tmp" != "$IMAGE" ]] || tmp="$PREFIX-provision-${IMAGE#$PREFIX-*-}"
+  check_name "$tmp"
+  if (( DRY_RUN )); then
+    mut create --from-ipsw "$ipsw" --disk-size "$disk" --disk-format asif "$tmp"
+    mut set "$tmp" --cpu "$CPUS" --memory $(( MEM_GB * 1024 ))
+    print -r -- "+ tart run --no-graphics --provisioning-opts=<account,ssh> $tmp; install key; seal"
+    print -r -- "+ tart rename $tmp $IMAGE; boot a clone and run boundary checks"
+    return 0
+  fi
+  ! vm_exists "$IMAGE" || die "$IMAGE already exists; delete it first to rebuild"
+  ! vm_exists "$tmp" || tart_ delete "$tmp"
+  ensure_ssh_material
+  VM="$tmp"; KEEP=$keep_failed
+  tart_ create --from-ipsw "$ipsw" --disk-size "$disk" --disk-format asif "$tmp"
+  tart_ set "$tmp" --cpu "$CPUS" --memory $(( MEM_GB * 1024 ))
+  local pw; pw="$(<"$SSHDIR/guest-password")"
+  say "first boot of $tmp (account '$GUSER', SSH on, auto-login)"
+  PW_AUTH=1
+  boot "$tmp" 0 "fullName=Test User,username=$GUSER,password=$pw,logsInAutomatically=true,enablesRemoteLogin=true"
+  local pub; pub="$(<"$SSHDIR/id_ed25519.pub")"
+  g /bin/sh -c 'umask 077 && mkdir -p "$HOME/.ssh" && printf "%s\n" "$1" > "$HOME/.ssh/authorized_keys"' sh "$pub"
+  PW_AUTH=0
+  wait_ssh 120
+  # Add project provisioning here (copy a script with put, run it with g), then seal.
+  say "sealing: sync and power off from inside the guest"
+  gin /usr/bin/sudo -S -p "" /bin/sh -c '/bin/sync && exec /sbin/shutdown -h now' \
+    <"$SSHDIR/guest-password" || (( $? == 255 )) || die "seal failed"
+  wait_power_off "$SHUTDOWN_TIMEOUT"
+  tart_ rename "$tmp" "$IMAGE"
+  VM=""
+  say "verifying the seal in a throwaway clone"
+  VM="$PREFIX-sealcheck-$(rand_hex 4)"; KEEP=0
+  tart_ clone "$IMAGE" "$VM"
+  tart_ set "$VM" --random-mac
+  boot "$VM" 0
+  boundary_checks
+  (( FAILED == 0 )) || { tart_ delete "$IMAGE"; die "new image failed its boundary checks; deleted"; }
+  say "image $IMAGE ready"
+}
+
+cmd_test() {
+  local app="" process="" seconds=20 graphics=1 report=""
+  while (( $# )); do
+    case "$1" in
+      --process) process="$2"; shift 2 ;;
+      --seconds) seconds="$2"; shift 2 ;;
+      --headless) graphics=0; shift ;;
+      --keep) KEEP=1; shift ;;
+      --report) report="$2"; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      -*) usage ;;
+      *) [[ -z "$app" ]] || usage; app="$1"; shift ;;
+    esac
+  done
+  [[ -d "$app" && "$app" == *.app ]] || die "first argument must be an .app bundle"
+  app="${app:A}"
+  [[ "$seconds" == <5-600> ]] || die "--seconds must be 5-600"
+  if [[ -z "$process" ]]; then
+    process="$(/usr/bin/plutil -extract CFBundleExecutable raw -o - "$app/Contents/Info.plist")" \
+      || die "cannot read CFBundleExecutable; pass --process"
+  fi
+  [[ "$process" == [A-Za-z0-9._\ -]## ]] || die "unexpected process name '$process'"
+  local name="$PREFIX-run-$(rand_hex 4)"
+  if (( DRY_RUN )); then
+    mut clone "$IMAGE" "$name"
+    mut set "$name" --cpu "$CPUS" --memory $(( MEM_GB * 1024 )) --random-mac
+    print -r -- "+ tart run ${${graphics:#1}:+--no-graphics }$name; copy ${app:t}; launch '$process' for ${seconds}s; check crashes; delete $name"
+    return 0
+  fi
+  vm_exists "$IMAGE" || die "base image $IMAGE is missing; run: tartvm image --ipsw FILE"
+  VM="$name"
+  local work; work="$(mktemp -d)"
+  local tar="$work/app.tar"
+  COPYFILE_DISABLE=1 tar -cf "$tar" -C "${app:h}" "${app:t}"
+  local digest; digest="$(host_sha256 "$tar")"
+  tart_ clone "$IMAGE" "$VM"
+  tart_ set "$VM" --cpu "$CPUS" --memory $(( MEM_GB * 1024 )) --random-mac
+  say "booting $VM"
+  boot "$VM" "$graphics"
+  boundary_checks
+  (( FAILED == 0 )) || die "VM boundary not established; not running the app"
+  local inbox="/Users/$GUSER/inbox"
+  g /bin/mkdir -p "$inbox"
+  put "$tar" "$inbox/app.tar"
+  rm -rf "$work"
+  local remote; remote="$(g /usr/bin/shasum -a 256 "$inbox/app.tar" | cut -d' ' -f1)"
+  [[ "$remote" == "$digest" ]] && record transfer pass "$digest" || { record transfer fail "hash mismatch"; finish "$report"; return; }
+  g /usr/bin/tar -xf "$inbox/app.tar" -C "$inbox"
+  g /usr/bin/touch "$inbox/.started"
+  say "launching $process (must stay alive ${seconds}s)"
+  local out
+  out="$(g /bin/sh -c "$LAUNCH_SCRIPT" sh "$inbox/${app:t}" "$process" "$seconds" 30 2>&1)" || true
+  if [[ "$out" == running\ <-> ]]; then record "launch.$process" pass "running after ${seconds}s (pid ${out#running })"
+  else record "launch.$process" fail "${out:-no output}"; fi
+  g /usr/bin/pkill -x "$process" || true
+  local crashes rc=0
+  crashes="$(g /usr/bin/find "/Users/$GUSER/Library/Logs/DiagnosticReports" -newer "$inbox/.started" -type f -name "$process*" 2>&1)" || rc=$?
+  if (( rc != 0 )) && [[ "$crashes" != *"No such file"* ]]; then record no_crash_report fail "cannot list: $crashes"
+  elif (( rc == 0 )) && [[ -n "$crashes" ]]; then record no_crash_report fail "${(f)crashes:t}"
+  else record no_crash_report pass none; fi
+  finish "$report"
+}
+
+finish() {
+  local report="$1"
+  if [[ -n "$report" ]]; then
+    { print -r -- "{\"vm\": \"$VM\", \"image\": \"$IMAGE\", \"passed\": $(( FAILED ? 0 : 1 )), \"checks\": ["
+      print -r -- "  ${(pj:,\n  :)CHECKS}"
+      print -r -- "]}"; } >"$report"
+  fi
+  (( FAILED == 0 )) || die "one or more checks failed"
+  say "all checks passed"
+}
+
+cmd_status() {
+  tart_ list --source local --format json
+}
+
+cmd_clean() {
+  while (( $# )); do case "$1" in --dry-run) DRY_RUN=1; shift ;; *) usage ;; esac; done
+  local line name
+  # Names only; running VMs and the base image are never touched.
+  tart_ list --source local --format json \
+    | /usr/bin/tr '{' '\n' | { /usr/bin/grep '"Running" *: *false' || true; } \
+    | /usr/bin/sed -n 's/.*"Name" *: *"\([^"]*\)".*/\1/p' | while read -r name; do
+      [[ "$name" == ${PREFIX}-(run|sealcheck|provision)-[A-Za-z0-9_.-]## ]] || continue
+      mut delete "$name"
+    done
+}
+
+(( $# )) || usage
+cmd="$1"; shift
+case "$cmd" in
+  -h|--help) usage ;;
+  doctor|image|test|status|clean) load_config; "cmd_$cmd" "$@" ;;
+  *) usage ;;
+esac
