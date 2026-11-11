@@ -15,7 +15,8 @@ provisioning step.
 
 Keep a lock file (JSON is fine) with, for each input: version, HTTPS URL, and a hash.
 
-- **Tart**: release tarball URL + SHA-256, plus the expected Developer ID Team ID. After
+- **Tart**: release tarball URL + SHA-256, plus the expected Developer ID Team ID
+  (this repo's pins are in `tartvm.lock.json`; `scripts/bootstrap.sh` does all of the below). After
   extraction run `codesign --verify --strict`, check `TeamIdentifier=` in `codesign -dv`,
   and require `spctl --assess --type execute` to accept it. Install it under your
   project's state directory, not via Homebrew, so upgrades are deliberate.

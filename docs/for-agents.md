@@ -8,7 +8,9 @@ reference material: read it, then make changes **in the target project**, not he
 2. Read `gotchas.md` before writing or debugging VM code.
 3. Copy from `../examples/` rather than writing from scratch, and copy the matching tests
    and fakes from `tests/`.
-4. Ask the user before downloading an IPSW, building an image, or booting a VM: these
+4. If this checkout has no `.env` or the pinned Tart is missing, run
+   `scripts/bootstrap.sh --dry-run` and show the user its plan (see `setup.md`).
+5. Ask the user before downloading an IPSW, building an image, or booting a VM: these
    take tens of GB and several minutes.
 
 When changing this repository itself:
