@@ -1,0 +1,7 @@
+#!/bin/sh
+echo "gh $*" >> "$FAKE_LOG"
+case "$1 $2" in
+  "auth status") exit "${FAKE_GH_AUTH_RC:-0}" ;;
+  "api user") case "$4" in .login) echo testuser ;; .id) echo 4242 ;; *) exit 99 ;; esac ;;
+  *) echo "fake gh: unexpected $*" >&2; exit 99 ;;
+esac

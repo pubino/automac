@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "tart": {
+    "version": "2.41.1",
+    "url": "https://github.com/openai/tart/releases/download/2.41.1/tart.tar.gz",
+    "sha256": "e680a734febccfce7d4e910c1f7f13fc3b00f19a181c945e2d746de3214c32c2",
+    "team_id": "9M2P8L4D89",
+    "license": "FSL-1.1-ALv2 (Fair Source); check its terms for your use"
+  },
+  "ipsw": {
+    "product_version": "27.2",
+    "build": "26B123",
+    "url": "https://updates.cdn-apple.com/2026FallFCS/c9671975-52db-4fb5-9af2-00217169ba8d/UniversalMac_27.2_26B123_Restore.ipsw",
+    "sha1": "617360e5619dbb424ed3774b98732bb3cfeacc0b",
+    "catalog": "https://mesu.apple.com/assets/macos/com_apple_macOSIPSW/com_apple_macOSIPSW.xml"
+  }
+}

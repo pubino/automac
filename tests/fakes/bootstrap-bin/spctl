@@ -1,0 +1,4 @@
+#!/bin/sh
+last=""; for a in "$@"; do last="$a"; done
+if [ -n "${FAKE_SPCTL_REJECT:-}" ]; then echo "$last: rejected" >&2; echo "source=Unnotarized Developer ID" >&2; exit 3; fi
+echo "$last: accepted" >&2; echo "source=Notarized Developer ID" >&2

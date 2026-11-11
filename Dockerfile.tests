@@ -6,10 +6,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# zsh runs the example scripts; ssh-keygen is used by the image flow. The fakes are run
-# under `env -i PATH=/usr/bin:/bin`, so python3 must also be reachable from /usr/bin.
+# zsh runs the example scripts; ssh-keygen is used by the image flow; jq and git by
+# bootstrap.sh. The fakes run under `env -i PATH=/usr/bin:/bin`, so python3 must also be
+# reachable from /usr/bin.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends zsh openssh-client \
+ && apt-get install -y --no-install-recommends zsh openssh-client jq git \
  && rm -rf /var/lib/apt/lists/* \
  && ln -s /usr/local/bin/python3 /usr/bin/python3
 
